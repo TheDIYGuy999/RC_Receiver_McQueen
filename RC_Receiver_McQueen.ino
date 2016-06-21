@@ -1,5 +1,5 @@
 // Disney "Lightning McQueen 95" toy car, conversion to proper Arduino RC control
-// 3.3V, 8MHz Pro Mini, DRV8833 DC motor driver, 2.4GHz NRF24L01 radio module
+// 3.3V, 8MHz Pro Micro, DRV8833 DC motor driver, 2.4GHz NRF24L01 radio module
 
 //
 // =======================================================================================================
