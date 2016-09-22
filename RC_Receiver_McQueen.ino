@@ -104,7 +104,7 @@ void setup() {
   radio.setChannel(1);
   radio.setPALevel(RF24_PA_HIGH);
   radio.setDataRate(RF24_250KBPS);
-  radio.setAutoAck(true);                  // Ensure autoACK is enabled
+  radio.setAutoAck(pipeIn[vehicleNumber - 1], true); // Ensure autoACK is enabled
   radio.enableAckPayload();
   radio.enableDynamicPayloads();
   radio.setRetries(5, 5);                  // 5x250us delay (blocking!!), max. 5 retries
