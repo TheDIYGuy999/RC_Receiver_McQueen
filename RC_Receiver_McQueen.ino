@@ -20,7 +20,6 @@
 #include <RF24.h> // Installed via Tools > Board > Boards Manager > Type RF24
 #include <printf.h>
 #include <Servo.h>
-#include <SimpleTimer.h> // https://github.com/jfturcot/SimpleTimer
 #include <PWMFrequency.h> // https://github.com/kiwisincebirth/Arduino/tree/master/libraries/PWMFrequency
 #include <DRV8833.h> // https://github.com/TheDIYGuy999/DRV8833
 #include <statusLED.h> // https://github.com/TheDIYGuy999/statusLED
@@ -35,10 +34,20 @@
 
 // Vehicle address
 int vehicleNumber = 1; // This number must be unique for each vehicle!
-const int maxVehicleNumber = 5;
+
+// Radio channels (126 channels are supported)
+byte chPointer = 0; // Channel 1 (the first entry of the array) is active by default
+const byte NRFchannel[] {
+  1, 2
+};
 
 // the ID number of the used "radio pipe" must match with the selected ID on the transmitter!
-const uint64_t pipeIn[maxVehicleNumber] = { 0xE9E8F0F0B1LL, 0xE9E8F0F0B2LL, 0xE9E8F0F0B3LL, 0xE9E8F0F0B4LL, 0xE9E8F0F0B5LL };
+// 10 ID's are available @ the moment
+const uint64_t pipeIn[] = {
+  0xE9E8F0F0B1LL, 0xE9E8F0F0B2LL, 0xE9E8F0F0B3LL, 0xE9E8F0F0B4LL, 0xE9E8F0F0B5LL,
+  0xE9E8F0F0B6LL, 0xE9E8F0F0B7LL, 0xE9E8F0F0B8LL, 0xE9E8F0F0B9LL, 0xE9E8F0F0B0LL
+};
+const int maxVehicleNumber = (sizeof(pipeIn) / (sizeof(uint64_t)));
 
 // Hardware configuration: Set up nRF24L01 radio on hardware SPI bus & pins A0 (CE) & A1 (CSN)
 RF24 radio(A0, A1);
@@ -49,8 +58,10 @@ struct RcData {
   byte axis2; // Elevator
   byte axis3; // Throttle
   byte axis4; // Rudder
-  boolean mode1 = false; // Speed limitation
-  boolean mode2 = false;
+  boolean mode1 = false; // Mode1 (toggle speed limitation)
+  boolean mode2 = false; // Mode2 (toggle acc. / dec. limitation)
+  boolean momentary1 = false; // Momentary push button
+  byte pot1; // Potentiometer
 };
 RcData data;
 
@@ -58,7 +69,8 @@ RcData data;
 struct ackPayload {
   float vcc; // vehicle vcc voltage
   float batteryVoltage; // vehicle battery voltage
-  boolean batteryOk; // the vehicle battery voltage is OK!
+  boolean batteryOk = true; // the vehicle battery voltage is OK!
+  byte channel = 1; // the channel number
 };
 ackPayload payload;
 
@@ -70,9 +82,6 @@ Servo steeringServo;
 
 // Status LED objects
 statusLED battLED(true); // true = inversed! (wired from pin to vcc)
-
-// Timer
-SimpleTimer timer;
 
 // Initialize DRV8833 H-Bridge
 #define motor_in1 5 // define motor pin numbers
@@ -101,7 +110,7 @@ void setup() {
 
   // Radio setup
   radio.begin();
-  radio.setChannel(1);
+  radio.setChannel(NRFchannel[chPointer]);
   radio.setPALevel(RF24_PA_HIGH);
   radio.setDataRate(RF24_250KBPS);
   radio.setAutoAck(pipeIn[vehicleNumber - 1], true); // Ensure autoACK is enabled
@@ -130,8 +139,6 @@ void setup() {
   data.axis2 = 50;
   data.axis3 = 50;
   data.axis4 = 50;
-
-  timer.setInterval(1000, checkBattery); // Check battery voltage every 100ms
 }
 
 //
@@ -142,9 +149,7 @@ void setup() {
 
 void led() {
 
-  // NOTE: The LED 17 (RX) is used
-
-  //batteryOK = false;
+  // NOTE: The on board LED 17 (RX) is used
 
   // Red LED (ON = battery empty, blinking = OK
   if (payload.batteryOk) {
@@ -181,11 +186,20 @@ void readRadio() {
 #endif
   }
 
+  // Switch channel
+  if (millis() - lastRecvTime > 500) {
+    chPointer ++;
+    if (chPointer >= sizeof((*NRFchannel) / sizeof(byte))) chPointer = 0;
+    radio.setChannel(NRFchannel[chPointer]);
+    payload.channel = NRFchannel[chPointer];
+  }
+
   if (millis() - lastRecvTime > 1000) { // bring all servos to their middle position, if no RC signal is received during 1s!
     data.axis1 = 50; // Aileron (Steering for car)
     data.axis2 = 50; // Elevator
     data.axis3 = 50; // Throttle
     data.axis4 = 50; // Rudder
+
 #ifdef DEBUG
     Serial.println("No Radio Available - Check Transmitter!");
 #endif
@@ -199,7 +213,7 @@ void readRadio() {
 //
 
 void writeSteeringServo() {
-  steeringServo.write(map(data.axis1, 100, 0, 68, 101) ); // 0 - 100% = 86 - 105° ( 90° is the center in theory) R - L
+  steeringServo.write(map(data.axis1, 100, 0, 61, 104) ); // 0 - 100% = 61 - 104° ( 90° is the center in theory) R - L
 }
 
 //
@@ -239,24 +253,72 @@ void driveMotor() {
 // =======================================================================================================
 //
 
+boolean battSense = true;
+float cutoffVoltage = 2.9;
+
 void checkBattery() {
 
-  payload.batteryVoltage = analogRead(BATTERY_DETECT_PIN) / 155.15; // 1023steps / 6.6V = 155.15
-  payload.vcc = readVcc() / 1000.0;
+  // Every 2000 ms
+  static unsigned long lastTrigger;
+  if (millis() - lastTrigger >= 2000) {
+    lastTrigger = millis();
 
-  if (payload.batteryVoltage >= 3.5) {
-    payload.batteryOk = true;
-#ifdef DEBUG
-    Serial.print(payload.batteryVoltage);
-    Serial.println(" V. Battery OK");
-#endif
-  } else {
-    payload.batteryOk = false;
-#ifdef DEBUG
-    Serial.print(payload.batteryVoltage);
-    Serial.println(" V. Battery empty!");
-#endif
+    // Read both averaged voltages
+    payload.batteryVoltage = batteryAverage();
+    payload.vcc = vccAverage();
+
+    if (battSense) { // Observe battery voltage
+      if (!payload.batteryVoltage >= cutoffVoltage) payload.batteryOk = false;
+    }
+    else { // Observe vcc voltage
+      if (!payload.vcc >= cutoffVoltage) payload.batteryOk = false;
+    }
   }
+}
+
+// Voltage read & averaging subfunctions -----------------------------------------
+// vcc ----
+float vccAverage() {
+  static int raw[6];
+
+  if (raw[0] == 0) {
+    for (int i = 0; i <= 5; i++) {
+      raw[i] = readVcc(); // Init array
+    }
+  }
+
+  raw[5] = raw[4];
+  raw[4] = raw[3];
+  raw[3] = raw[2];
+  raw[2] = raw[1];
+  raw[1] = raw[0];
+  raw[0] = readVcc();
+  float average = (raw[0] + raw[1] + raw[2] + raw[3] + raw[4] + raw[5]) / 6000.0;
+  return average;
+}
+
+// battery ----
+float batteryAverage() {
+  static int raw[8];
+
+  if (!battSense) return 0;
+
+  if (raw[0] == 0) {
+    for (int i = 0; i <= 7; i++) {
+      raw[i] = analogRead(BATTERY_DETECT_PIN); // Init array
+    }
+  }
+
+  raw[7] = raw[6];
+  raw[6] = raw[5];
+  raw[5] = raw[4];
+  raw[4] = raw[3];
+  raw[3] = raw[2];
+  raw[2] = raw[1];
+  raw[1] = raw[0];
+  raw[0] = analogRead(BATTERY_DETECT_PIN);
+  float average = (raw[0] + raw[1] + raw[2] + raw[3] + raw[4] + raw[5] + raw[6] + raw[7]) / 1240.0; // 1023steps / 6.6V * 8 = 1240
+  return average;
 }
 
 //
@@ -266,9 +328,6 @@ void checkBattery() {
 //
 
 void loop() {
-
-  // Timer
-  timer.run();
 
   // Read radio data from transmitter
   readRadio();
@@ -281,5 +340,8 @@ void loop() {
 
   // LED
   led();
+
+  // Battery check
+  checkBattery();
 }
 
